@@ -1,0 +1,188 @@
+
+# settings
+set export := true
+set dotenv-load := true
+set positional-arguments
+
+# runtime
+temp := `mktemp -d`
+glab := "bin/glab"
+args := "--per-page 500"
+DRY := if env('DRY', "no") =~ "1|y|yes|true" { "echo" } else { "" }
+exclude := "NO-FILTER"
+include := ""
+
+# variables
+group := ""
+labels := ""
+assignee := ""
+milestone := ""
+#milestone := "XC NorthStar-2024"
+epic := ""
+output := ""
+outfmt := if output == "tsv" { "-O json |jq '.[]|([.web_url]+(.labels|sort))|@tsv' -r " } else \
+          if output == "csv" { "-O json |jq '.[]|([.web_url]+(.labels|sort))|@csv' -r " } else \
+          { "-F urls" }
+
+[private]
+@default:
+  just -l
+
+
+#[group('ISSUE')]
+# `glab issue` wrapper function
+@issue +cmd:
+      echo {{glab}} issue {{cmd}}
+      $DRY {{glab}} issue {{cmd}}
+alias i := issue
+
+# glab wrapper
+[private]
+@_glab *args="":
+  {{glab}} {{args}}
+
+# Test function
+[private]
+test *args=args:
+  #just labels="{{labels}}" assignee="{{assignee}}" milestone="{{milestone}}" output="csv" issue | sed 's/,/\t,/' 
+  echo "{{glab}} issue list -g "{{group}}" --assignee '{{assignee}}' --milestone="{{milestone}}" {{args}} {{outfmt}}" 
+  {{glab}} issue list -g "{{group}}" --assignee '{{assignee}}' --milestone="{{milestone}}" {{args}} {{outfmt}} 
+
+# , separated for AND
+# % separated for OR
+[private]
+@issue-list-by-labels *args=args:
+  for i in '{{replace(replace(labels, "%", " "), " ", "' '")}}'; do \
+    {{glab}} issue list -g "{{group}}" --label "$i" --assignee "{{assignee}}" --milestone="{{milestone}}" {{args}} {{outfmt}} >> {{temp}}/q_labels; \
+  done;
+
+
+#[group('ISSUE')]
+# List issues based on two labels with OR condition (as a join of two independent queries)
+@issue-list *args=args: 
+  [[ -z "{{labels}}" ]] || just labels="{{labels}}" temp="{{temp}}" assignee="{{assignee}}" milestone="{{milestone}}" output="{{output}}" issue-list-by-labels {{args}};
+  [[ -n "{{labels}}" ]] || $DRY {{glab}} issue list -g "{{group}}" --assignee '{{assignee}}' --milestone="{{milestone}}" {{args}} {{outfmt}} >> {{temp}}/q_labels;
+  test -e {{temp}}/q_labels && sort -u {{temp}}/q_labels | grep "{{include}}" | grep -Ev "(/work_items/|{{exclude}})" || true
+
+
+#[group('ISSUE')]
+# Print details about an issue
+@issue-show id:
+    {{glab}} issue show {{id}}
+
+#[group('ISSUE')]
+# Update issue label, only update/create if label does not yet exist
+@issue-add-label label="status::new":
+    just labels="{{labels}}" assignee="{{assignee}}" milestone="{{milestone}}" output="csv" include="{{include}}" exclude="{{exclude}}" issue-list | sed 's/,/\t,/' | grep -v ',"{{replace_regex(label,"::.*", "::")}}' |\
+      cut -f1 | xargs -I% $DRY {{glab}} issue update --label '{{label}}' %
+
+#[group('ISSUE')]
+# Update label on the issue
+@issue-force-label label:
+    just labels="{{labels}}" assignee="{{assignee}}" milestone="{{milestone}}" include="{{include}}" exclude="{{exclude}}" issue-list |\
+      xargs -I% $DRY {{glab}} issue update --label '{{label}}' %
+
+#[group('ISSUE')]
+# Update issue assignee
+@issue-add-assignee ass:
+    just labels="{{labels}}" assignee="{{assignee}}" milestone="{{milestone}}" include="{{include}}" exclude="{{exclude}}" issue-list |\
+      xargs -I% $DRY {{glab}} issue update --assignee '{{ass}}' %
+
+#[group('ISSUE')]
+# Add comment to multiple issues
+@issue-add-note +comment:
+    just labels="{{labels}}" assignee="{{assignee}}" milestone="{{milestone}}" include="{{include}}" exclude="{{exclude}}" issue-list |\
+      xargs -I% $DRY {{glab}} issue note % -m "{{comment}}"
+
+
+
+#[group('PM-NOT-TESTED')]
+# PM related - reuest to update label
+@issue-pm-request-label LABEL:
+  just labels="{{labels}}" assignee="{{assignee}}" milestone="{{milestone}}" include="{{include}}" exclude="{{exclude}}" issue-list |\
+    awk '!/{{LABEL}}/{print $1}' | $DRY xargs -I% just issue note % -m \'Please update {{LABEL}} label.\' 
+
+# PM related - reuest to update status (if status::new and issue older 3 weeks)
+# NOT TESTED, weak impl.
+# TBD add AGE parameter
+# @issue-pm-request-update MESSAGE:
+#   just labels="{{labels}}" assignee="{{assignee}}" milestone="{{milestone}}" include="{{include}}" exclude="{{exclude}}" issue-list |\
+#     awk '/status::new/{print $1}' | $DRY xargs -I% just issue note % -m \'Please update progress on the issue by the status:: label. Thanks.\' 
+
+
+#[group('TEAM')]
+# Update labels on SRE EMEA team assigned issues
+team-sre-emea-update *ASSIGNEE="epcim":
+  #!/usr/bin/env bash
+  set -eo pipefail
+  declare -A MILESTONE=([4568508]="NorthStar-2024")
+  for i in {{ASSIGNEE}}; do
+    just assignee="$i" issue-add-label status::new &&\
+    just assignee="$i" exclude="support" issue-add-label xc::sre &&\
+    just assignee="$i" exclude="support" milestone="None"  issue-list | xargs -rn1 just issue update --milestone "${!MILESTONE[@]}"
+
+    # optional
+    # just assignee="$i" exclude="support" milestone="${MILESTONE[@]}" output=tsv issue-list | awk '!/Release::/{print $1}' |xargs -I% just issue note % -m \'Please update Release:: label\'
+    # just assignee=$i issue-add-label priority::medium
+  done;
+
+
+
+# TOOLS
+
+# open url
+[private]
+@open url *args:
+  open {{args}} {{url}}
+
+# tail
+[private]
+tail n="200":
+    tail -{{n}}f {{temp}}/cmdlog
+
+# schedules operations formatted like '<cron_expression> <decrypt|encrypt> <target>'
+@_schedule operation:
+    @just _run_detached "schedule" "{{operation}}"
+    @just tail 20
+
+# run detached
+@_run_detached command *arguments:
+    $DRY nohup {{command}} {{arguments}} #&>| {{temp}}/cmdlog.$RANDOM &
+
+
+
+# TO EXPLORE
+# | parallel --colsep ' +' -X --tty vi {1}
+
+
+
+# API GRAPHQL
+# 
+# glab api
+# query number of tickets per team, status, priority, milestone, release
+
+# glab api issues --paginate
+[private]
+@query-test:
+  #!/usr/bin/env bash
+  $DRY {{glab}} api graphql -f query='
+    query {
+      project(fullPath: "gitlab-org/gitlab-docs") {
+        name
+        forksCount
+        statistics {
+          wikiSize
+        }
+        issuesEnabled
+        boards {
+          nodes {
+            id
+            name
+          }
+        }
+      }
+    }
+  '
+
+  # query($userLogin: String!) {
+  # user(login: $userLogin) {
